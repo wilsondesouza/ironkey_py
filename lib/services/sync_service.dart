@@ -26,108 +26,135 @@ class SyncService {
         'treeUri': treeUriStr,
       });
 
-      if (remoteData == null || remoteData['hasBlob'] == false) {
-        // Primeira sincronização ou pasta vazia: faz upload do estado local
+      final bool hasBlob = remoteData != null && remoteData['hasBlob'] == true;
+      final List<dynamic> rawConflicts = remoteData?['conflicts'] as List<dynamic>? ?? [];
+
+      if (!hasBlob && rawConflicts.isEmpty) {
+        // Primeira sincronização ou pasta vazia: faz upload do estado local inicial
         return await _initialUpload(treeUriStr, deviceId);
       }
 
-      final String blobBase64 = remoteData['blobBase64'] as String;
-      final String manifestStr = remoteData['manifest'] as String;
-      final List<dynamic> rawConflicts = remoteData['conflicts'] as List<dynamic>? ?? [];
+      int remoteGen = 0;
+      final List<VaultEntry> remoteEntries = [];
 
-      // 2. Validação do Manifesto (se disponível)
-      if (manifestStr.isNotEmpty) {
+      // 2. Decifra o blob principal
+      if (hasBlob) {
+        final String blobBase64 = remoteData!['blobBase64'] as String;
+        final String manifestStr = remoteData['manifest'] as String;
+
+        if (manifestStr.isNotEmpty) {
+          try {
+            final Map<dynamic, dynamic>? valRes = await _syncChannel.invokeMethod('verifyManifest', {
+              'manifest': manifestStr,
+              'blobBase64': blobBase64,
+            });
+
+            if (valRes == null || valRes['valid'] != true) {
+              final String reasonMsg = valRes?['reason'] ?? 'Aviso na verificação do manifesto.';
+              syncWarnings.add(reasonMsg);
+            }
+          } catch (_) {}
+        }
+
         try {
-          final Map<dynamic, dynamic>? valRes = await _syncChannel.invokeMethod('verifyManifest', {
-            'manifest': manifestStr,
+          final Map<dynamic, dynamic>? doc = await _syncChannel.invokeMethod('readSyncBlob', {
             'blobBase64': blobBase64,
           });
-
-          if (valRes == null || valRes['valid'] != true) {
-            final String reasonMsg = valRes?['reason'] ?? 'Aviso na verificação do manifesto.';
-            syncWarnings.add(reasonMsg);
+          if (doc != null) {
+            remoteGen = (doc['generation'] as num?)?.toInt() ?? 0;
+            final List<dynamic> remoteEntriesRaw = doc['entries'] as List<dynamic>? ?? [];
+            for (final m in remoteEntriesRaw) {
+              remoteEntries.add(VaultEntry.fromMap(Map<String, dynamic>.from(m)));
+            }
           }
-        } catch (_) {}
+        } on PlatformException catch (e) {
+          syncWarnings.add('Erro na decifragem do arquivo principal: ${e.message}');
+        } catch (e) {
+          syncWarnings.add('Falha ao decifrar blob principal: $e');
+        }
       }
 
-      // 3. Decifra e autentica o blob remoto via AES-256-GCM + AAD
-      final Map<dynamic, dynamic>? doc;
-      try {
-        doc = await _syncChannel.invokeMethod('readSyncBlob', {
-          'blobBase64': blobBase64,
-        });
-      } on PlatformException catch (e) {
-        final detail = e.message ?? e.toString();
-        return SyncOutcome(
-          status: 'error',
-          message: 'Erro na decifragem: $detail',
-          warnings: syncWarnings,
-        );
-      } catch (e) {
-        return SyncOutcome(
-          status: 'error',
-          message: 'Falha ao decifrar: $e',
-          warnings: syncWarnings,
-        );
-      }
-
-      if (doc == null) {
-        return SyncOutcome(
-          status: 'error',
-          message: 'Falha ao decifrar documento de sincronização.',
-          warnings: syncWarnings,
-        );
-      }
-
-      final int remoteGen = (doc['generation'] as num).toInt();
-      final List<dynamic> remoteEntriesRaw = doc['entries'] as List<dynamic>;
-      final List<VaultEntry> remoteEntries = remoteEntriesRaw
-          .map((m) => VaultEntry.fromMap(Map<String, dynamic>.from(m)))
-          .toList();
-
-      // 4. Incorpora cópias de conflito criadas por provedores de nuvem (Dropbox/Drive)
+      // 3. Incorpora cópias de conflito criadas por provedores de nuvem (Dropbox/Drive/OneDrive)
       for (final conflict in rawConflicts) {
         try {
           final cBlobBase64 = conflict['dataBase64'] as String;
+          final cFilename = conflict['filename'] as String? ?? 'conflito';
           final Map<dynamic, dynamic>? cDoc = await _syncChannel.invokeMethod('readSyncBlob', {
             'blobBase64': cBlobBase64,
           });
           if (cDoc != null) {
-            final cEntriesRaw = cDoc['entries'] as List<dynamic>;
+            final int cGen = (cDoc['generation'] as num?)?.toInt() ?? 0;
+            if (cGen > remoteGen) {
+              remoteGen = cGen;
+            }
+            final cEntriesRaw = cDoc['entries'] as List<dynamic>? ?? [];
             for (final item in cEntriesRaw) {
               remoteEntries.add(VaultEntry.fromMap(Map<String, dynamic>.from(item)));
             }
+            syncWarnings.add('Cópia de nuvem incorporada: $cFilename (geração $cGen)');
           }
         } catch (_) {}
       }
 
-      // 5. Executa a Mesclagem (Merge) Registro por Registro
+      if (remoteEntries.isEmpty && !hasBlob) {
+        return SyncOutcome(
+          status: 'error',
+          message: 'Nenhum arquivo de sincronização válido encontrado na pasta.',
+          warnings: syncWarnings,
+        );
+      }
+
+      // Desduplica lista remota se houver registros com o mesmo UID vindos de arquivos de conflito
+      final Map<String, VaultEntry> canonicalRemoteMap = {};
+      for (final r in remoteEntries) {
+        final existing = canonicalRemoteMap[r.uid];
+        if (existing == null || r.rev > existing.rev || (r.rev == existing.rev && r.updatedAt.compareTo(existing.updatedAt) > 0)) {
+          canonicalRemoteMap[r.uid] = r;
+        }
+      }
+      final List<VaultEntry> consolidatedRemote = canonicalRemoteMap.values.toList();
+
+      // 4. Executa a Mesclagem (Merge) Registro por Registro
       final List<VaultEntry> localEntries = await StorageService.getAllEntries(includeDeleted: true);
-      final mergeResult = await _mergeEntries(localEntries, remoteEntries, deviceId);
+      final mergeResult = await _mergeEntries(localEntries, consolidatedRemote, deviceId);
 
       // Salva os registros atualizados localmente
       for (final entry in mergeResult.toSaveLocally) {
         await StorageService.saveEntry(entry);
       }
 
-      // 6. Grava de volta na nuvem se houve mudanças ou novo generation
-      final int newGen = remoteGen + 1;
-      final List<VaultEntry> allCurrent = await StorageService.getAllEntries(includeDeleted: true);
-      final List<Map<String, dynamic>> syncList = allCurrent.map((e) => e.toSyncMap()).toList();
+      final lastGenStr = await StorageService.getMeta('sync_last_generation');
+      final int knownGen = int.tryParse(lastGenStr ?? '0') ?? 0;
+      final int newGen = (remoteGen > knownGen ? remoteGen : knownGen) + 1;
 
-      final Map<dynamic, dynamic>? buildRes = await _syncChannel.invokeMethod('buildSyncPayload', {
-        'generation': newGen,
-        'entries': syncList,
-        'deviceId': deviceId,
-        'purgedUids': <String>[],
-      });
+      // 5. Grava de volta na nuvem se houve modificações ou novos registros
+      final bool needsUpload = mergeResult.added > 0 ||
+          mergeResult.updated > 0 ||
+          mergeResult.removed > 0 ||
+          mergeResult.conflicts > 0 ||
+          localEntries.length != consolidatedRemote.length;
 
-      if (buildRes != null) {
-        await _storageChannel.invokeMethod('writeRemoteFiles', {
-          'treeUri': treeUriStr,
-          'blobBase64': buildRes['blobBase64'],
-          'manifest': buildRes['manifest'],
+      if (needsUpload) {
+        final List<VaultEntry> allCurrent = await StorageService.getAllEntries(includeDeleted: true);
+        final List<Map<String, dynamic>> syncList = allCurrent.map((e) => e.toSyncMap()).toList();
+
+        final Map<dynamic, dynamic>? buildRes = await _syncChannel.invokeMethod('buildSyncPayload', {
+          'generation': newGen,
+          'entries': syncList,
+          'deviceId': deviceId,
+          'purgedUids': <String>[],
         });
+
+        if (buildRes != null) {
+          await _storageChannel.invokeMethod('writeRemoteFiles', {
+            'treeUri': treeUriStr,
+            'blobBase64': buildRes['blobBase64'],
+            'manifest': buildRes['manifest'],
+          });
+          await StorageService.setMeta('sync_last_generation', newGen.toString());
+        }
+      } else {
+        await StorageService.setMeta('sync_last_generation', remoteGen.toString());
       }
 
       return SyncOutcome(
@@ -137,7 +164,7 @@ class SyncService {
         updated: mergeResult.updated,
         removed: mergeResult.removed,
         conflicts: mergeResult.conflicts,
-        generation: newGen,
+        generation: needsUpload ? newGen : remoteGen,
         warnings: syncWarnings,
       );
     } catch (e) {
@@ -162,6 +189,7 @@ class SyncService {
         'blobBase64': buildRes['blobBase64'],
         'manifest': buildRes['manifest'],
       });
+      await StorageService.setMeta('sync_last_generation', '1');
     }
 
     return SyncOutcome(status: 'ok', added: localEntries.length, generation: 1);
@@ -192,7 +220,7 @@ class SyncService {
           added++;
         }
       } else if (local != null && remote == null) {
-        // Registro local que ainda não subiu — mantém
+        // Registro local que ainda não existe na nuvem — mantém
       } else if (local != null && remote != null) {
         // Ambos existem: compara `rev`
         if (remote.rev > local.rev) {
@@ -210,7 +238,7 @@ class SyncService {
           final remoteJson = jsonEncode(remote.toSyncMap());
 
           if (localJson != remoteJson) {
-            // Conflito Real de Edição!
+            // Conflito Real de Edição Simultânea
             conflicts++;
             final bool remoteWins = remote.updatedAt.compareTo(local.updatedAt) >= 0;
             final winner = remoteWins ? remote : local;

@@ -9,15 +9,15 @@ import java.io.InputStream
 import java.io.OutputStream
 
 /**
- * Ponte com o Android Storage Access Framework (SAF) para persistência de pasta em nuvem.
+ * Ponte resiliente com o Android Storage Access Framework (SAF) para persistência de pasta em nuvem.
+ * Gerencia leitura, detecção de cópias de conflito de serviços de nuvem (Drive, Dropbox, OneDrive)
+ * e escrita atômica com limpeza de duplicatas.
  */
 class SafStorageBridge(private val context: Context) {
 
     companion object {
         const val SYNC_BLOB_NAME = "ironkeypy-sync.ikbak"
         const val MANIFEST_NAME = "ironkeypy-sync.manifest.json"
-        const val TEMP_BLOB_NAME = "ironkeypy-sync.ikbak.tmp"
-        const val TEMP_MANIFEST_NAME = "ironkeypy-sync.manifest.json.tmp"
     }
 
     fun persistTreeUriPermission(treeUri: Uri, flags: Int? = null) {
@@ -33,11 +33,8 @@ class SafStorageBridge(private val context: Context) {
     fun readRemoteBlob(treeUri: Uri): ByteArray? {
         return try {
             val tree = DocumentFile.fromTreeUri(context, treeUri) ?: return null
-            var file = tree.findFile(SYNC_BLOB_NAME)
-            if (file == null) {
-                file = tree.listFiles().firstOrNull { it.name?.equals(SYNC_BLOB_NAME, ignoreCase = true) == true }
-            }
-            if (file == null) return null
+            val matching = tree.listFiles().filter { it.name?.equals(SYNC_BLOB_NAME, ignoreCase = true) == true }
+            val file = matching.maxByOrNull { it.lastModified() } ?: tree.findFile(SYNC_BLOB_NAME) ?: return null
             readFileBytes(file.uri)
         } catch (e: Throwable) {
             null
@@ -47,11 +44,8 @@ class SafStorageBridge(private val context: Context) {
     fun readRemoteManifest(treeUri: Uri): String? {
         return try {
             val tree = DocumentFile.fromTreeUri(context, treeUri) ?: return null
-            var file = tree.findFile(MANIFEST_NAME)
-            if (file == null) {
-                file = tree.listFiles().firstOrNull { it.name?.equals(MANIFEST_NAME, ignoreCase = true) == true }
-            }
-            if (file == null) return null
+            val matching = tree.listFiles().filter { it.name?.equals(MANIFEST_NAME, ignoreCase = true) == true }
+            val file = matching.maxByOrNull { it.lastModified() } ?: tree.findFile(MANIFEST_NAME) ?: return null
             val bytes = readFileBytes(file.uri) ?: return null
             String(bytes, Charsets.UTF_8)
         } catch (e: Throwable) {
@@ -63,12 +57,25 @@ class SafStorageBridge(private val context: Context) {
         val results = mutableListOf<Pair<String, ByteArray>>()
         try {
             val tree = DocumentFile.fromTreeUri(context, treeUri) ?: return emptyList()
-            for (file in tree.listFiles()) {
+            val allFiles = tree.listFiles()
+            
+            // Localiza o arquivo principal para não listá-lo como cópia de conflito
+            val mainBlob = allFiles.filter { it.name?.equals(SYNC_BLOB_NAME, ignoreCase = true) == true }
+                .maxByOrNull { it.lastModified() }
+
+            for (file in allFiles) {
                 val name = file.name ?: continue
-                if (name == SYNC_BLOB_NAME || name == MANIFEST_NAME) continue
-                if (name.startsWith("ironkeypy-sync") && name.endsWith(".ikbak")) {
+                val nameLower = name.lowercase()
+
+                if (file.uri == mainBlob?.uri) continue
+                if (nameLower == MANIFEST_NAME.lowercase()) continue
+                if (nameLower.endsWith(".tmp") || nameLower.startsWith(".")) continue
+
+                // Detecta qualquer variante de sincronização gerada por nuvens
+                val isSyncVariant = nameLower.contains("ironkeypy-sync") && !nameLower.contains("manifest")
+                if (isSyncVariant) {
                     val bytes = readFileBytes(file.uri)
-                    if (bytes != null) {
+                    if (bytes != null && bytes.isNotEmpty()) {
                         results.add(Pair(name, bytes))
                     }
                 }
@@ -82,25 +89,39 @@ class SafStorageBridge(private val context: Context) {
     fun writeRemoteFiles(treeUri: Uri, blobBytes: ByteArray, manifestJsonStr: String): Boolean {
         return try {
             val tree = DocumentFile.fromTreeUri(context, treeUri) ?: return false
+            val allFiles = tree.listFiles()
 
-            // 1. Grava ou sobrescreve o arquivo de dados
-            var blobFile = tree.findFile(SYNC_BLOB_NAME)
-            if (blobFile == null) {
-                blobFile = tree.listFiles().firstOrNull { it.name?.equals(SYNC_BLOB_NAME, ignoreCase = true) == true }
+            // 1. Grava o arquivo principal de dados (e limpa duplicatas exatas se houver)
+            val blobMatches = allFiles.filter { it.name?.equals(SYNC_BLOB_NAME, ignoreCase = true) == true }
+            val blobFile = if (blobMatches.isNotEmpty()) {
+                val target = blobMatches.maxByOrNull { it.lastModified() }!!
+                // Deleta cópias duplicadas com o mesmo nome para evitar ambiguidade no SAF
+                for (dup in blobMatches) {
+                    if (dup.uri != target.uri) {
+                        try { dup.delete() } catch (_: Throwable) {}
+                    }
+                }
+                target
+            } else {
+                tree.createFile("application/octet-stream", SYNC_BLOB_NAME) ?: return false
             }
-            if (blobFile == null) {
-                blobFile = tree.createFile("application/octet-stream", SYNC_BLOB_NAME) ?: return false
-            }
+
             if (!writeFileBytes(blobFile.uri, blobBytes)) return false
 
-            // 2. Grava ou sobrescreve o manifesto autenticado
-            var manifestFile = tree.findFile(MANIFEST_NAME)
-            if (manifestFile == null) {
-                manifestFile = tree.listFiles().firstOrNull { it.name?.equals(MANIFEST_NAME, ignoreCase = true) == true }
+            // 2. Grava o manifesto autenticado
+            val manifestMatches = allFiles.filter { it.name?.equals(MANIFEST_NAME, ignoreCase = true) == true }
+            val manifestFile = if (manifestMatches.isNotEmpty()) {
+                val target = manifestMatches.maxByOrNull { it.lastModified() }!!
+                for (dup in manifestMatches) {
+                    if (dup.uri != target.uri) {
+                        try { dup.delete() } catch (_: Throwable) {}
+                    }
+                }
+                target
+            } else {
+                tree.createFile("application/json", MANIFEST_NAME) ?: return false
             }
-            if (manifestFile == null) {
-                manifestFile = tree.createFile("application/json", MANIFEST_NAME) ?: return false
-            }
+
             writeFileBytes(manifestFile.uri, manifestJsonStr.toByteArray(Charsets.UTF_8))
         } catch (e: Throwable) {
             false
